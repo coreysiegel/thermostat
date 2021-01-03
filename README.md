@@ -6,7 +6,8 @@ Prototyping and hardware design at: https://www.tinkercad.com/things/53NZLudUo1p
 
 Note: all temperature values are intended to be in 0.1 degF, but can be easily adjusted. Integer math used for speed and simplicity, and to utilize the FastPID library: https://github.com/mike-matera/FastPID
 
-*** Feature list ***
+Feature list
+============
  * Temp sensing via AI
  * SP adjustment via pushbuttons on voltage divider into AI
  * PID control
@@ -22,11 +23,13 @@ Note: all temperature values are intended to be in 0.1 degF, but can be easily a
  * schedule (untested)
  * TODO AI calibration
 
-*** Inputs and Outputs ***
+Inputs and Outputs
+==================
 AI's: 0-5V temperature sensor(s) based on TMP36
 YC's: On-off heater connected to relay, LED (with resistor in series), or servo motor based on SM-S2309S
 
-*** Common Terminology ***
+Common Terminology
+==================
 AI = analog input (physical device)
 AC = analog controller (software device)
 CV = control value (controller output)
