@@ -13,13 +13,14 @@
  * serial output graphing
  * multiple zones
  * real-time clock
- * TODO scheduled temp sensing
+ * schedule
  * TODO AI calibration
  * ******************** */
 
-#define TINKERCAD
+//#define TINKERCAD
 #define DEBUG
 //#define SHOWMEMORY
+//#define VERBOSESERIAL
 
 #ifdef TINKERCAD
 #define DEBUG
@@ -53,16 +54,18 @@ int freeMemory() {
 bool ready(unsigned long *, unsigned long);
 byte readAnalogButton(unsigned long);
 void printVal(char*, long);
+void updateLCDclock();
 
 // Serial
 // http://www.arduino.cc/en/Tutorial/AnalogReadSerial
+// https://www.arduino.cc/en/Tutorial/BuiltInExamples/ReadASCIIString
 const bool serialplot = true; // false = verbose text output
 
 // LCD
 // http://www.arduino.cc/en/Tutorial/LiquidCrystalHelloWorld
 const int rs = 12, en = 11, d4 = 5, d5 = 4, d6 = 3, d7 = 2;
 LiquidCrystal lcd(rs, en, d4, d5, d6, d7);
-int lcdold[] = {0, 0, 0, 0, 0};
+long lcdold[] = {-1, 0, 0, 0, 0};
 byte lcd_tc = 0;
 
 // lcd update timing
@@ -72,10 +75,6 @@ unsigned long kloopold = 0;
 // analog input setup
 const unsigned long AIRES = 358;
 const unsigned long AIRES2 = 1011;
-
-// real-time clock
-const unsigned long MAXSEC = 86400;
-unsigned long rtc = 0; // seconds since midnight
 
 class AI {
 	public:
@@ -192,7 +191,7 @@ class YC {
 };
 YC **actuators; // array of pointers to YC objects
 #ifdef DEBUG
-byte n_yc = 4;
+byte n_yc = 2;
 const unsigned long actuator_freq = 500;
 #else
 byte n_yc = 2;
@@ -211,6 +210,12 @@ const int hs02lookup[7] = {0, -100, -10, -1, 1, 10, 100};
 const unsigned long KHS02 = 50;
 unsigned long khs02old = 0;
 
+// *** Real Time Clock ***
+const unsigned long MAXSEC = 86400;
+unsigned long rtc = 0; // seconds since midnight
+const long hs02seclookup[] = {0, -60*60, -60, -1, 1, 60, 60*60};
+unsigned long krtcold = 0;
+
 // TC-01: room temperature control
 class AC {
 	public:
@@ -220,6 +225,10 @@ class AC {
 		float kp, ki, kd;
 		unsigned long freq; //ms
 		unsigned long last=0;
+		byte nsteps=0;
+		byte currstep=0, nextstep=0;
+		unsigned long *sched_t; // assumed to be sorted
+		int *sched_sp;
 
 	private:
 		int range2;
@@ -244,7 +253,50 @@ class AC {
 #endif
 		}
 
+		// sched_t and sched_sp are created and initialized by caller, deleted by class
+		// shed_t is assumed to be sorted
+		// must be called after rtc is initialized
+		void assign_schedule(byte _nsteps, unsigned long *_sched_t, int *_sched_sp) {
+			if (nsteps != 0) { // schedule update?
+				delete[] sched_t;
+				delete[] sched_sp;
+			}
+			nsteps = _nsteps;
+			sched_t = _sched_t;
+			sched_sp = _sched_sp;
+			if (nsteps != 0) {
+				if (nsteps == 1) {
+					currstep = nextstep = 0;
+					sp = sched_sp[0];
+				} else {
+					int i;
+					for (i=0; i<nsteps; i++) // will overflow gracefully
+						if (rtc < sched_t[i])
+							break;
+					if (i == 0)
+						currstep = nsteps - 1;
+					else
+						currstep = i - 1; // including for-loop overflow
+					sp = sched_sp[currstep];
+					if (currstep == nsteps - 1)
+						nextstep = 0;
+					else
+						nextstep = currstep + 1;
+				}
+			}
+		}
+
 		bool update() {
+			// update sp per schedule
+			if (nsteps != 0 && rtc >= sched_t[nextstep]) { // assume we can catch it between last step and midnight
+				currstep = nextstep;
+				if (currstep == nsteps - 1)
+					nextstep = 0;
+				else
+					nextstep = currstep + 1;
+				sp = sched_sp[currstep];
+			}
+			// calculate new cv
 			if (ready(&last, freq)) {
 				pv->update();
 				int error = pv->pv - sp;
@@ -263,26 +315,42 @@ class AC {
 #ifndef TINKERCAD
 			delete pid;
 #endif
+			if (nsteps != 0) {
+				delete[] sched_t;
+				delete[] sched_sp;
+			}
 		}
 };
 AC **tc;
 byte n_tc = n_yc;
 
-void setup() {
-  Serial.begin(9600);
+void printAvailMemory() {
 #ifdef SHOWMEMORY
-  Serial.print("Available memory: ");
-  Serial.println(freeMemory());
+	Serial.print("Available memory: ");
+	Serial.println(freeMemory());
 #endif
+}
 
-	// Temp input
+void setup() {
+	// *** Serial Part 1 ***
+	Serial.begin(115200);
+	Serial.println();
+	Serial.println();
+#ifdef VERBOSESERIAL
+	Serial.print("Starting setup at ");
+	Serial.println(millis());
+#endif
+	printAvailMemory();
+	delay(100);
+
+	// *** Temp input ***
 	ti = new AI*[n_ti]; // array of pointers to AI objects
 	ti[0] = new AI(0, 300, 900, 200);
 	if (n_ti>=2) {
 		ti[1] = new AI(2, 300, 900, 200);
 	}
 
-	// Actuators
+	// *** Actuators ***
 	actuators = new YC*[n_yc];
 	actuators[0] = new YC(RELAY, 13, 0, 100, 500);
 	if (n_yc >= 2) {
@@ -295,28 +363,183 @@ void setup() {
 		}
 	}
 
-	// Setpoint
+	// *** Setpoint ***
 	pinMode(hs01pin, INPUT_PULLUP);
 
-	// Controllers
+	// *** Controllers ***
+	float Kp = 0.1, Ki = 0.1, Kd = 0;
 	tc = new AC*[n_tc];
-	tc[0] = new AC(ti[0], 680, actuators[0], 0.1, 0.1, 0, actuators[0]->freq);
+	tc[0] = new AC(ti[0], 680, actuators[0], Kp, Ki, Kd, actuators[0]->freq);
 	if (n_tc >= 2) {
-		tc[1] = new AC(ti[1], 680, actuators[1], 0.1, 0.1, 0, actuators[1]->freq);
+		tc[1] = new AC(ti[1], 680, actuators[1], Kp, Ki, Kd, actuators[1]->freq);
 		if (n_tc >=3) {
-			tc[2] = new AC(ti[0], 680, actuators[2], 0.1, 0.1, 0, actuators[2]->freq);
+			tc[2] = new AC(ti[0], 680, actuators[2], Kp, Ki, Kd, actuators[2]->freq);
 			if (n_tc >= 4) {
-				tc[3] = new AC(ti[1], 680, actuators[3], 0.1, 0.1, 0, actuators[3]->freq);
+				tc[3] = new AC(ti[1], 680, actuators[3], Kp, Ki, Kd, actuators[3]->freq);
+
 			}
 		}
 	}
 
-	// LCD(ncol, nrow)
+	// *** LCD(ncol, nrow) ***
 	lcd.begin(16, 2);
-	// Initial LCD text
-	lcd.setCursor(0, 0);
-	lcd.print(0);
-	//lcdold[0] = 0; //default
+
+	// *** Real-Time Clock ***
+	//lcdold[0] = -1; //default
+	printAvailMemory();
+#ifdef VERBOSESERIAL
+	Serial.print("Determining RTC...");
+#endif
+	byte hs01 = digitalRead(hs01pin);
+	while (hs01 == HIGH) {
+		updateLCDclock();
+		while (!ready(&krtcold, KHS02) && hs01 == HIGH && Serial.available() == 0)
+			hs01 = digitalRead(hs01pin);
+		unsigned long hs02raw = analogRead(hs02pin);
+		if (Serial.available() > 0) {
+			unsigned long hr = Serial.parseInt();
+			unsigned long min = Serial.parseInt();
+			unsigned long sec = Serial.parseInt();
+			if (Serial.read() == '\n')
+				;
+			rtc = (hr*60+min)*60+sec;
+			break;
+		} else {
+			byte hs02id = readAnalogButton(hs02raw);
+			if (hs02id != hs02idold) {
+				hs02idold = hs02id;
+				int hs02delta = hs02seclookup[hs02id];
+				if (hs02delta != 0) {
+					rtc += hs02delta;
+					if (rtc >= 2*MAXSEC)
+						rtc += MAXSEC;
+					else if (rtc >= MAXSEC)
+						rtc -= MAXSEC;
+				}
+			}
+		}
+	}
+	krtcold = millis();
+	updateLCDclock();
+#ifdef VERBOSESERIAL
+	Serial.print("Done at ");
+	Serial.println(millis());
+	Serial.print(krtcold);
+	Serial.print(" ms = ");
+	Serial.print(rtc);
+	Serial.println(" sec");
+#endif
+	printAvailMemory();
+	while (hs01 == LOW)
+		hs01 = digitalRead(hs01pin);
+	hs01old = HIGH;
+
+	// *** Controller schedules ***
+#ifdef VERBOSESERIAL
+	Serial.print("Creating TC[0] schedule...");
+#endif
+	byte nsteps = 3;
+	unsigned long *sched_t = (unsigned long*)malloc(sizeof(unsigned long)*nsteps);
+	int *sched_sp = (int*)malloc(sizeof(int)*nsteps);
+	// bedroom
+	sched_t[0]=(unsigned long) 7*60*60; sched_sp[0]=620;
+	sched_t[1]=(unsigned long)19*60*60; sched_sp[1]=700;
+	sched_t[2]=(unsigned long)22*60*60; sched_sp[2]=670;
+#ifdef VERBOSESERIAL
+	Serial.print("Done at ");
+	Serial.println(millis());
+#endif
+	printAvailMemory();
+#ifdef VERBOSESERIAL
+	Serial.print("Assigning TC[0] schedule...");
+#endif
+	tc[0]->assign_schedule(nsteps, sched_t, sched_sp);
+#ifdef VERBOSESERIAL
+	Serial.print("Done at ");
+	Serial.println(millis());
+#endif
+	printAvailMemory();
+	if (n_tc >= 2) {
+#ifdef VERBOSESERIAL
+		Serial.print("Creating TC[1] schedule...");
+#endif
+		nsteps = 6;
+		sched_t = (unsigned long*)malloc(sizeof(unsigned long)*nsteps);
+		sched_sp = (int*)malloc(sizeof(int)*nsteps);
+		// living room
+		sched_t[0]=(unsigned long)(6*60+30)*60; sched_sp[0]=680;
+		sched_t[1]=(unsigned long) 8*60*60; sched_sp[1]=650;
+		sched_t[2]=(unsigned long)12*60*60; sched_sp[2]=670;
+		sched_t[3]=(unsigned long)13*60*60; sched_sp[3]=650;
+		sched_t[4]=(unsigned long)(16*60+30)*60; sched_sp[4]=680;
+		sched_t[5]=(unsigned long)22*60*60; sched_sp[5]=620;
+#ifdef VERBOSESERIAL
+		Serial.print("Done at ");
+		Serial.println(millis());
+#endif
+		printAvailMemory();
+#ifdef VERBOSESERIAL
+		Serial.print("Assigning TC[1] schedule...");
+#endif
+		tc[1]->assign_schedule(nsteps, sched_t, sched_sp);
+#ifdef VERBOSESERIAL
+		Serial.print("Done at ");
+		Serial.println(millis());
+#endif
+		printAvailMemory();
+		if (n_tc >= 3) {
+#ifdef VERBOSESERIAL
+			Serial.print("Creating TC[2] schedule...");
+#endif
+			nsteps = 2;
+			sched_t = (unsigned long*)malloc(sizeof(unsigned long)*nsteps);
+			sched_sp = (int*)malloc(sizeof(int)*nsteps);
+			// office
+			sched_t[0]=(unsigned long) 8*60*60; sched_sp[0]=670;
+			sched_t[1]=(unsigned long)17*60*60; sched_sp[1]=620;
+#ifdef VERBOSESERIAL
+			Serial.print("Done at ");
+			Serial.println(millis());
+#endif
+			printAvailMemory();
+#ifdef VERBOSESERIAL
+			Serial.print("Assigning TC[2] schedule...");
+#endif
+			tc[2]->assign_schedule(nsteps, sched_t, sched_sp);
+#ifdef VERBOSESERIAL
+			Serial.print("Done at ");
+			Serial.println(millis());
+#endif
+			printAvailMemory();
+			if (n_tc >= 4) {
+#ifdef VERBOSESERIAL
+				Serial.print("Creating TC[3] schedule...");
+#endif
+				nsteps = 2;
+				sched_t = (unsigned long*)malloc(sizeof(unsigned long)*nsteps);
+				sched_sp = (int*)malloc(sizeof(int)*nsteps);
+				// office #2
+				sched_t[0]=(unsigned long) 8*60*60; sched_sp[0]=670;
+				sched_t[1]=(unsigned long)17*60*60; sched_sp[1]=620;
+#ifdef VERBOSESERIAL
+				Serial.print("Done at ");
+				Serial.println(millis());
+#endif
+				printAvailMemory();
+#ifdef VERBOSESERIAL
+				Serial.print("Assigning TC[3] schedule...");
+#endif
+				tc[3]->assign_schedule(nsteps, sched_t, sched_sp);
+#ifdef VERBOSESERIAL
+				Serial.print("Done at ");
+				Serial.println(millis());
+#endif
+				printAvailMemory();
+			}
+		}
+	}
+
+	// *** Initial LCD text ***
 	lcd.setCursor(10, 0);
 	lcd.print("CV");
 	int _cv = tc[lcd_tc]->cv->pos;
@@ -335,15 +558,17 @@ void setup() {
 	lcd.print(_sp);
 	lcdold[3] = _sp;
 
-	// Serial
+	// *** Serial Part 2 ***
+	delay(50);
 	for (int i=0; i<n_tc; i++) {
-		Serial.print("tc[");
+		Serial.print("pv");
 		Serial.print(i);
-		Serial.print("].pv\ttc[");
+		Serial.print("\tsp");
 		Serial.print(i);
-		Serial.print("].sp\ttc[");
+		Serial.print("\tcv");
 		Serial.print(i);
-		Serial.print("].cv\t");
+		Serial.print("\t");
+		delay(50);
 	}
 	Serial.println("");
 	for (int i=0; i<n_tc; i++) {
@@ -353,24 +578,27 @@ void setup() {
 		Serial.print('\t');
 		Serial.print(tc[i]->cv->pos);
 		Serial.print('\t');
+		delay(50);
 	}
+	delay(200);
 	Serial.println("");
-#ifdef SHOWMEMORY
-  Serial.begin(9600);
-  Serial.print("Available memory: ");
-  Serial.println(freeMemory());
+	delay(50);
+#ifdef VERBOSESERIAL
+	Serial.print("Setup...Done at ");
+	Serial.println(millis());
 #endif
-
+	printAvailMemory();
+	delay(250);
 }
 
 void loop() {
 	unsigned long now;
 
-	/* *** Input PV *** */
+	// *** Input PV ***
 	for (int i=0; i<n_ti; i++)
 		ti[i]->update();
 
-	/* *** Input SP*** */
+	// *** Input SP***
 	if (ready(&khs02old, KHS02)) {
 		byte hs01 = digitalRead(hs01pin);
 		if (hs01 != hs01old) {
@@ -397,27 +625,28 @@ void loop() {
 		}
 	}
 
-	/* *** Calculate CV *** */
+	// *** Calculate CV and Output Heater ***
 	for (int i=0; i<n_tc; i++)
 		tc[i]->update();
 
-	/* *** Output Heater *** */
-	for (int i=0; i<n_yc; i++)
-		actuators[i]->update();
+	// *** Output Heater ***
+	//for (int i=0; i<n_yc; i++)
+	//actuators[i]->update();
 
-	/* *** Output LCD & plot *** */
+	// *** Real Time Clock ***
+	if (ready(&krtcold, 1000)) {
+		rtc++;
+		if (rtc >= MAXSEC)
+			rtc -= MAXSEC;
+		updateLCDclock();
+	}
+
+	// *** Output LCD & plot ***
 	if (ready(&kloopold, KLOOP)) {
-		now = millis();
 		int _cv = tc[lcd_tc]->cv->pos;
 		int _pv = tc[lcd_tc]->pv->pv;
 		int _sp = tc[lcd_tc]->sp;
-		if (now != lcdold[0]) {
-			lcd.setCursor(0, 0);
-			lcd.print("       ");
-			lcd.setCursor(0, 0);
-			lcd.print(now);
-			lcdold[0] = now;
-		}
+		// lcdold[0] updated in RTC above
 		if (_cv != lcdold[1]) {
 			lcd.setCursor(10, 0);
 			lcd.print("CV   ");
@@ -444,6 +673,16 @@ void loop() {
 			lcd.print(_sp);
 			lcdold[3] = _sp;
 		}
+#ifdef VERBOSESERIAL
+		Serial.print(millis());
+		Serial.print('\t');
+		Serial.print(rtc / 60 / 60);
+		Serial.print('\t');
+		Serial.print((rtc / 60) % 60);
+		Serial.print('\t');
+		Serial.print(rtc % 60);
+		Serial.print('\t');
+#endif
 		for (int i=0; i<n_tc; i++) {
 			Serial.print(tc[i]->pv->pv);
 			Serial.print('\t');
@@ -453,11 +692,7 @@ void loop() {
 			Serial.print('\t');
 		}
 		Serial.println("");
-#ifdef SHOWMEMORY
-    Serial.begin(9600);
-    Serial.print("Available memory: ");
-    Serial.println(freeMemory());
-#endif
+		printAvailMemory();
 	}
 }
 
@@ -502,4 +737,28 @@ byte readAnalogButton(unsigned long val) {
 void printVal(char* str, long val) {
 	Serial.print(str);
 	Serial.println(val);
+}
+
+void updateLCDclock() {
+	byte hr, min, sec;
+	sec = rtc % 60;
+	min = (rtc / 60) % 60;
+	hr = rtc / 60 / 60;
+	if (rtc != lcdold[0]) {
+		lcd.setCursor(0, 0);
+		lcd.print("  :  :  ");
+		lcd.setCursor(0, 0);
+		if (hr < 10)
+			lcd.print("0");
+		lcd.print(hr);
+		lcd.setCursor(3, 0);
+		if (min < 10)
+			lcd.print("0");
+		lcd.print(min);
+		lcd.setCursor(6, 0);
+		if (sec < 10)
+			lcd.print("0");
+		lcd.print(sec);
+		lcdold[0] = rtc;
+	}
 }
