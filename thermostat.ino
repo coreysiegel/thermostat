@@ -130,6 +130,7 @@ class AI {
 	public:
 		byte pin;
 		unsigned long raw = 0;
+		unsigned long raw_acc = 0;
 		unsigned long raw_arr[pv_filt_len];
 		byte curr_raw_id = 0;
 
@@ -171,12 +172,13 @@ class AI {
 
 	private:
 		void forceupdate() {
-			this->raw -= this->raw_arr[this->curr_raw_id] / pv_filt_len;
 			this->curr_raw_id++;
 			if (this->curr_raw_id >= pv_filt_len)
 				this->curr_raw_id = 0;
+			this->raw_acc -= this->raw_arr[this->curr_raw_id];
 			this->raw_arr[this->curr_raw_id] = analogRead(this->pin);
-			this->raw += this->raw_arr[this->curr_raw_id] / pv_filt_len;
+			this->raw_acc += this->raw_arr[this->curr_raw_id];
+			this->raw = this->raw_acc / pv_filt_len;
 			this->pv = map(this->raw, this->cal[0], this->cal[1], this->cal[2], this->cal[3]);
 		}
 
