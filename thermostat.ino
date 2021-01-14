@@ -2,6 +2,7 @@
 
 /* *** Feature list ***
  * Temp sensing via AI
+ * Moving low-pass filter for AI
  * SP adjustment via pushbuttons on voltage divider into AI
  * TODO PID control
  * TODO PID loop tuning
@@ -55,6 +56,7 @@
 const unsigned long KLOOP = 100; // LCD
 const byte n_ti = 1; // PVs
 const unsigned long ti_freq = 200;
+const byte pv_filt_len = 6; // number of samples in moving low-pass filter
 const byte n_yc = n_ti; // actuators
 const unsigned long actuator_freq = 5000; // also for tc's
 const unsigned long KHS02 = 50; // all pushbuttons
@@ -127,7 +129,9 @@ long curr_cal_pv;
 class AI {
 	public:
 		byte pin;
-		unsigned long raw;
+		unsigned long raw = 0;
+		unsigned long raw_arr[pv_filt_len];
+		byte curr_raw_id = 0;
 
 		int pv;
 		int pvmin;
@@ -143,7 +147,10 @@ class AI {
 			this->pvmin = _pvmin;
 			this->pvmax = _pvmax;
 			this->freq = _freq;
-			this->forceupdate();
+			for (int i=0; i<pv_filt_len; i++)
+				this->raw_arr[i] = 0;
+			for (int i=0; i<pv_filt_len; i++)
+				this->forceupdate();
 		}
 
 		void updateCal(long raw1, long raw2, long pv1, long pv2) {
@@ -164,7 +171,12 @@ class AI {
 
 	private:
 		void forceupdate() {
-			this->raw = analogRead(this->pin);
+			this->raw -= this->raw_arr[this->curr_raw_id] / pv_filt_len;
+			this->curr_raw_id++;
+			if (this->curr_raw_id >= pv_filt_len)
+				this->curr_raw_id = 0;
+			this->raw_arr[this->curr_raw_id] = analogRead(this->pin);
+			this->raw += this->raw_arr[this->curr_raw_id] / pv_filt_len;
 			this->pv = map(this->raw, this->cal[0], this->cal[1], this->cal[2], this->cal[3]);
 		}
 
