@@ -95,8 +95,7 @@ int freeMemory() {
 bool ready(unsigned long *, unsigned long);
 byte readAnalogButton(unsigned long);
 void printVal(char*, long);
-void printClockToLCD(unsigned long);
-void printClockToLCD(unsigned long, boolean);
+void printClockToLCD(unsigned long, boolean = false);
 
 // Serial
 // http://www.arduino.cc/en/Tutorial/AnalogReadSerial
@@ -693,10 +692,6 @@ byte readAnalogButton(unsigned long val) {
 void printVal(char* str, long val) {
 	Serial.print(str);
 	Serial.println(val);
-}
-
-void printClockToLCD(unsigned long now) {
-	printClockToLCD(now, false);
 }
 
 void printClockToLCD(unsigned long now, boolean forceupdate) {
