@@ -3,7 +3,9 @@
 /* *** Feature list ***
  * Temp sensing via AI
  * Moving low-pass filter for AI
+ * AI calibration
  * SP adjustment via pushbuttons on voltage divider into AI
+ * TODO use median of multiple AIs per AC
  * TODO PID control
  * TODO PID loop tuning
  * relay control
@@ -16,16 +18,18 @@
  * clock
  * TODO real-time clock
  * TODO scheduled temp sensing
- * AI calibration
  * TODO EEPROM (for cals, SPs)
  * ******************** */
 
 /* *** Physical I/O ***
  * Analog pins
  * 0 TI-01
- * 1 HS-02 (adjustment button array for setpoint or cal pv)
+ * 1 HS-02 (6-button array for setpoint or cal pv adjustment)
  * 2 TI-02
- * 3-5 Not connected
+ * 3 TI-03
+ * 4 TI-04
+ * 5 Not connected
+ * Note: Quantity of temperature sensors is specified by "n_ti"
  * 
  * Digital pins
  * 0-1 Reserved (Serial)
@@ -39,6 +43,8 @@
  * 13 YC-01 (Relay from TC/TI-01)
  * Note: If HS-01 is held and then HS-03 is pressed, controller will exit 
  * calibration mode without saving current cal info
+ * Note: Quantity of actuators (and corresponding software controllers is
+ * specified by "n_yc"
  * 
  * Power
  * 3.3V: Not connected
@@ -50,16 +56,17 @@
  * ******************** */
 
 #define TINKERCAD
-//#define DEBUG
 //#define SHOWMEMORY
 
-const unsigned long KLOOP = 100; // LCD
-const byte n_ti = 1; // PVs
-const unsigned long ti_freq = 200;
-const byte pv_filt_len = 6; // number of samples in moving low-pass filter
+const byte n_ti = 4; // PVs
+const unsigned long ti_freq = (unsigned long)5*60*1000;
+const byte pv_filt_len = 1; // number of samples in moving low-pass filter
+const long cal[4] = {119, 223, 610, 720}; // initial PV cal points {raw1, raw2, pv1, pv2}
 const byte n_yc = n_ti; // actuators
-const unsigned long actuator_freq = 5000; // also for tc's
+const unsigned long actuator_freq = (unsigned long)5000; // also for tc's
 const unsigned long KHS02 = 50; // all pushbuttons
+const unsigned long KLCD = 1000; // LCD
+const unsigned long KSERIAL = ti_freq;
 #ifdef TINKERCAD
 const float Kp=1, Ki=0, Kd=0;
 #else
@@ -100,6 +107,7 @@ void printClockToLCD(unsigned long, boolean = false);
 // Serial
 // http://www.arduino.cc/en/Tutorial/AnalogReadSerial
 const bool serialplot = true; // false = verbose text output
+unsigned long kserialold = 0;
 
 // LCD
 // http://www.arduino.cc/en/Tutorial/LiquidCrystalHelloWorld
@@ -108,9 +116,7 @@ LiquidCrystal lcd(rs, en, d4, d5, d6, d7);
 int lcdold[] = {0, 0, 0, 0, 0};
 byte lcd_tc = 0;
 boolean lcd_cal = false;
-
-// lcd update timing
-unsigned long kloopold = 0;
+unsigned long klcdold = 0;
 
 // analog input setup
 //const unsigned long AIRES = 358;
@@ -354,8 +360,18 @@ void setup() {
 	// Temp input
 	ti = new AI*[n_ti]; // array of pointers to AI objects
 	ti[0] = new AI(0, 300, 900, ti_freq);
+	ti[0]->updateCal(cal[0], cal[1], cal[2], cal[3]);
 	if (n_ti>=2) {
 		ti[1] = new AI(2, 300, 900, ti_freq);
+		ti[1]->updateCal(cal[0], cal[1], cal[2], cal[3]);
+		if (n_ti>=3) {
+			ti[2] = new AI(3, 300, 900, ti_freq);
+			ti[2]->updateCal(cal[0], cal[1], cal[2], cal[3]);
+			if (n_ti>=4) {
+				ti[3] = new AI(4, 300, 900, ti_freq);
+				ti[3]->updateCal(cal[0], cal[1], cal[2], cal[3]);
+			}
+		}
 	}
 
 	// Actuators
@@ -381,9 +397,15 @@ void setup() {
 	if (n_tc >= 2) {
 		tc[1] = new AC(ti[1], 680, actuators[1], Kp, Ki, Kd, actuators[1]->freq);
 		if (n_tc >=3) {
-			tc[2] = new AC(ti[0], 680, actuators[2], Kp, Ki, Kd, actuators[2]->freq);
+			if (n_ti >= 3)
+				tc[2] = new AC(ti[2], 680, actuators[2], Kp, Ki, Kd, actuators[2]->freq);
+			else
+				tc[2] = new AC(ti[0], 680, actuators[2], Kp, Ki, Kd, actuators[2]->freq);
 			if (n_tc >= 4) {
-				tc[3] = new AC(ti[1], 680, actuators[3], Kp, Ki, Kd, actuators[3]->freq);
+				if (n_ti >= 4)
+					tc[3] = new AC(ti[3], 680, actuators[3], Kp, Ki, Kd, actuators[3]->freq);
+				else
+					tc[3] = new AC(ti[1], 680, actuators[3], Kp, Ki, Kd, actuators[3]->freq);
 			}
 		}
 	}
@@ -510,13 +532,9 @@ void loop() {
 	for (int i=0; i<n_yc; i++)
 		actuators[i]->update();
 
-	/* *** Output LCD & plot *** */
-	if (ready(&kloopold, KLOOP)) {
-#ifdef DEBUG
-		now = millis();
-#else
+	/* *** Output LCD *** */
+	if (ready(&klcdold, KLCD)) {
 		now = millis()/1000;
-#endif
 		int _cv = tc[lcd_tc]->cv->pos;
 		int _pv = tc[lcd_tc]->pv->pv;
 		int _sp = tc[lcd_tc]->sp;
@@ -629,11 +647,16 @@ void loop() {
 				}
 			}
 		}
-		Serial.print(now/60/60*10);
+	}
+
+	/* *** Output Serial *** */
+	if (ready(&kserialold, KSERIAL)) {
+		now = millis()/1000;
+		Serial.print(now/60/60);
 		Serial.print(' ');
-		Serial.print(now/60%60*10);
+		Serial.print(now/60%60);
 		Serial.print(' ');
-		Serial.print(now%60*10);
+		Serial.print(now%60);
 		Serial.print(' ');
 		for (int i=0; i<n_tc; i++) {
 			Serial.print(tc[i]->pv->pv);
