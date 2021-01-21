@@ -61,7 +61,7 @@
 const byte n_ti = 4; // PVs
 const unsigned long ti_freq = (unsigned long)5*60*1000;
 const byte pv_filt_len = 1; // number of samples in moving low-pass filter
-const long cal[4] = {119, 223, 610, 720}; // initial PV cal points {raw1, raw2, pv1, pv2}
+const long cal[4] = {119, 223, 585, 720}; // initial PV cal points {raw1, raw2, pv1, pv2}
 const byte n_yc = n_ti; // actuators
 const unsigned long actuator_freq = (unsigned long)5000; // also for tc's
 const unsigned long KHS02 = 50; // all pushbuttons
@@ -120,7 +120,8 @@ unsigned long klcdold = 0;
 
 // analog input setup
 //const unsigned long AIRES = 358;
-const unsigned long AIRES2 = 1011;
+const float ANALOGBUTTONSLOPE = -132;
+const float ANALOGBUTTONINTERCEPT = 996;
 
 // analog input calibration
 byte ai_cal = false;
@@ -159,11 +160,20 @@ class AI {
 				this->forceupdate();
 		}
 
+		void updateCal(byte id, long raw, long pv) {
+			if (id>=0 && id<=1) {
+				this->cal[id] = raw;
+				this->cal[id+2] = pv;
+				this->forceupdate();
+			}
+		}
+
 		void updateCal(long raw1, long raw2, long pv1, long pv2) {
 			this->cal[0] = raw1;
 			this->cal[1] = raw2;
 			this->cal[2] = pv1;
 			this->cal[3] = pv2;
+			this->forceupdate();
 		}
 
 		bool update() {
@@ -321,12 +331,6 @@ class AC {
 				this->pv->update();
 				int error = this->pv->pv - this->sp;
 				//printVal("Error: ", error);
-				/*
-#ifdef TINKERCAD
-int _cv = map(error*kp, -range2, range2, cv->maxp, cv->minp);
-#else
-int _cv = pid->step(sp, pv->pv);
-#endif*/
 				int _cv;
 				if (error <= 0)
 					_cv = this->cv->maxp;
@@ -461,8 +465,17 @@ void setup() {
 
 }
 
+unsigned long now = 0;
+byte hs01 = 0;
+unsigned long hs02raw = 0;
+byte hs03 = 0;
+byte hs02id = 0;
+int hs02delta = 0;
+int _cv = 0;
+int _pv = 0;
+int _sp = 0;
+
 void loop() {
-	unsigned long now;
 
 	/* *** Input PV *** */
 	if (! ai_cal)
@@ -471,10 +484,10 @@ void loop() {
 
 	/* *** Input SP or Calibration *** */
 	if (ready(&khs02old, KHS02)) {
-		byte hs01 = digitalRead(hs01pin);
-		unsigned long hs02raw = analogRead(hs02pin);
-		byte hs03 = digitalRead(hs03pin);
-		byte hs02id = readAnalogButton(hs02raw);
+		hs01 = digitalRead(hs01pin);
+		hs02raw = analogRead(hs02pin);
+		hs03 = digitalRead(hs03pin);
+		hs02id = readAnalogButton(hs02raw);
 		if (hs03 == LOW) { // if pushed, don't process other buttons
 			if (hs03 != hs03old) {
 				ai_cal = !ai_cal;
@@ -483,10 +496,8 @@ void loop() {
 					curr_cal_raw = tc[lcd_tc]->pv->raw;
 					curr_cal_pv = tc[lcd_tc]->pv->pv;
 				} else { // save cal info if HS-01 is not pushed
-					if (hs01 == HIGH) {
-						tc[lcd_tc]->pv->cal[curr_cal_val] = curr_cal_raw;
-						tc[lcd_tc]->pv->cal[curr_cal_val+2] = curr_cal_pv;
-					}
+					if (hs01 == HIGH)
+						tc[lcd_tc]->pv->updateCal(curr_cal_val, curr_cal_raw, curr_cal_pv);
 				}
 			}
 		} else {
@@ -498,7 +509,7 @@ void loop() {
 						curr_cal_val = 0;
 				}
 				if (hs02id != hs02idold) {
-					int hs02delta = hs02lookup[hs02id];
+					hs02delta = hs02lookup[hs02id];
 					if (hs02delta != 0) {
 						curr_cal_pv += hs02delta;
 					}
@@ -510,7 +521,7 @@ void loop() {
 						lcd_tc = 0;
 				}
 				if (hs02id != hs02idold) {
-					int hs02delta = hs02lookup[hs02id];
+					hs02delta = hs02lookup[hs02id];
 					if (hs02delta != 0) {
 						int *sp = &(tc[lcd_tc]->sp);
 						*sp += hs02delta;
@@ -535,9 +546,10 @@ void loop() {
 	/* *** Output LCD *** */
 	if (ready(&klcdold, KLCD)) {
 		now = millis()/1000;
-		int _cv = tc[lcd_tc]->cv->pos;
-		int _pv = tc[lcd_tc]->pv->pv;
-		int _sp = tc[lcd_tc]->sp;
+		_cv = tc[lcd_tc]->cv->pos;
+		//_cv = hs02raw;
+		_pv = tc[lcd_tc]->pv->pv;
+		_sp = tc[lcd_tc]->sp;
 		if (lcd_cal != ai_cal) {
 			lcd.clear();
 
@@ -574,12 +586,12 @@ void loop() {
 				lcd.setCursor(0, 1);
 				lcd.print(lcd_tc);
 				lcd.print(" PV");
-				int _pv = tc[lcd_tc]->pv->pv;
+				_pv = tc[lcd_tc]->pv->pv;
 				lcd.print(_pv);
 				lcdold[2] = _pv;
 				lcd.setCursor(10, 1);
 				lcd.print("SP");
-				int _sp = tc[lcd_tc]->sp;
+				_sp = tc[lcd_tc]->sp;
 				lcd.print(_sp);
 				lcdold[3] = _sp;
 			}
@@ -701,13 +713,11 @@ bool ready(unsigned long *kold, unsigned long period=0) {
 }
 
 byte readAnalogButton(unsigned long val) {
-	float avg = (float)AIRES2 / (float)(NUMSP+1);
-
-	if (val < 0.5*avg)
+	if (val < 6.5*ANALOGBUTTONSLOPE + ANALOGBUTTONINTERCEPT)
 		return 0;
-	for (int currbutton=0; currbutton<NUMSP; currbutton++)
-		if (val < ((float)currbutton + 1.5)*avg)
-			return NUMSP-currbutton;
+	for (int currbutton=1; currbutton<=NUMSP; currbutton++)
+		if (val > ((float)currbutton + 0.5)*ANALOGBUTTONSLOPE + ANALOGBUTTONINTERCEPT)
+			return currbutton;
 
 	return 0;
 }
